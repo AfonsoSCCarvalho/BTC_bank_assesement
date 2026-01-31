@@ -60,6 +60,9 @@ E) Out-of-window timestamps (clock drift / late events)
    - Some events occur slightly before/after the target month.
    - Real-world causes: device clock skew, offline mode + delayed sync, ingestion delays.
 
+
+Add insights:
+In order to make it more realistic (and interessant) I made some scenarios of our feature adoption.
 Notes for reviewers
 -------------------
 - Rates for anomalies are parameterized and can be tuned.
@@ -75,6 +78,41 @@ import uuid
 from datetime import datetime, timedelta
 from calendar import monthrange
 from pathlib import Path
+
+# ----------------------------
+# Scenario controls (for insights & recommendations)
+# ----------------------------
+TOP_ADOPTION_COUNTRY = "FR"   # country with most feature users + most transactions
+VIP_COUNTRY = "CH"            # fewer transactions, much higher amounts
+
+# user population distribution (weights sum doesn't need to be 1)
+COUNTRY_WEIGHTS = {
+    "FR": 0.38, "PT": 0.12, "ES": 0.10, "DE": 0.10, "IT": 0.10,
+    "NL": 0.07, "BE": 0.06, "GB": 0.05, "IE": 0.01, "CH": 0.01
+}
+
+# feature adoption probability by country (controls "who uses the new feature")
+FEATURE_ADOPTION_RATE = {
+    "FR": 0.75,  # high adoption
+    "PT": 0.25, "ES": 0.25, "DE": 0.25, "IT": 0.25, "NL": 0.25,
+    "BE": 0.25, "GB": 0.25, "IE": 0.25,
+    "CH": 0.08   # low adoption, VIP-like
+}
+
+# amount multiplier by sender country (controls "who moves big money")
+AMOUNT_MULTIPLIER = {
+    "FR": 1.10,
+    "PT": 1.00, "ES": 1.00, "DE": 1.00, "IT": 1.00, "NL": 1.00,
+    "BE": 1.00, "GB": 1.00, "IE": 1.00,
+    "CH": 8.00   # few txns, very large amounts
+}
+
+# time trend: push activity + amounts upward across the month
+TXN_TREND_STRENGTH = 2.5   # higher -> more txns late in month
+AMOUNT_TREND_STRENGTH = 0.8  # higher -> bigger amounts late in month
+
+# optional: keep P2P more “local” (same-country receivers)
+SAME_COUNTRY_RECEIVER_PROB = 0.65
 
 # ----------------------------
 # Helpers Functions
@@ -131,27 +169,34 @@ OS_LIST = ["Android 14", "Android 13", "iOS 26", "iOS 18", "Windows 11", "macOS 
 def generate_users(n_users: int, month_start: datetime, month_end: datetime,
                    null_email_rate=0.01, null_signup_rate=0.01): # just a small fraction of users with missing email or signup_at
     users = []
-    user_meta = {}  # user_id -> dict with signup_dt (may be None)
+    user_meta = {}
+
+    countries = list(COUNTRY_WEIGHTS.keys())
+    weights = list(COUNTRY_WEIGHTS.values())
+
     for user_id in range(1, n_users + 1):
         fn = random.choice(FIRST_NAMES)
         ln = random.choice(LAST_NAMES)
         base_email = f"{fn}.{ln}{random.randint(10,9999)}@example.com".lower()
 
-        # Most signups occur in the target month
         signup_dt = rand_dt(month_start, month_end)
 
-        #Let's inject some anomalies here
-        # Anomaly: missing signup_at (critical field)
+        # anomalies (probabilistic)
         if random.random() < null_signup_rate:
             signup_dt_val = ""
             signup_dt_obj = None
         else:
             signup_dt_val = iso(signup_dt)
             signup_dt_obj = signup_dt
-        # Anomaly: missing email (critical-ish field)
+
         email_val = "" if random.random() < null_email_rate else base_email
-        # Small realism: created_at could match signup_at; keep it same here
-        country = random.choice(COUNTRIES)
+
+        # scenario: weighted country distribution
+        country = random.choices(countries, weights=weights, k=1)[0]
+
+        # scenario: feature adoption flag (who actually uses P2P feature)
+        adopt_p = FEATURE_ADOPTION_RATE.get(country, 0.25)
+        is_feature_user = (random.random() < adopt_p)
 
         users.append({
             "user_id": user_id,
@@ -161,42 +206,117 @@ def generate_users(n_users: int, month_start: datetime, month_end: datetime,
             "country": country,
             "signup_at": signup_dt_val,
         })
-        user_meta[user_id] = {"signup_dt": signup_dt_obj}
+
+        user_meta[user_id] = {
+            "signup_dt": signup_dt_obj,
+            "country": country,
+            "is_feature_user": is_feature_user,
+        }
+
     return users, user_meta
 
-def generate_transactions(n_txns: int, n_users: int, month_start: datetime, month_end: datetime, user_meta,
-                          before_signup_rate=0.02, dup_id_rate=0.01, null_amount_rate=0.01):
-    # small fraction of transactions before signup, duplicate IDs, missing amounts
+def generate_transactions(
+    n_txns: int,
+    n_users: int,
+    month_start: datetime,
+    month_end: datetime,
+    user_meta,
+    before_signup_rate=0.02,
+    dup_id_rate=0.01,
+    null_amount_rate=0.01,
+):
     txns = []
 
-    def pick_distinct_users():
-        sender = random.randint(1, n_users)
-        receiver = random.randint(1, n_users)
-        while receiver == sender:
-            receiver = random.randint(1, n_users)
-        return sender, receiver
+    # precompute "feature users" (adopted users generate transactions)
+    feature_users = [uid for uid in range(1, n_users + 1) if user_meta[uid]["is_feature_user"]]
+    if len(feature_users) < 10:
+        feature_users = list(range(1, n_users + 1))  # fallback safety
 
+    # day weighting for crescendo usage
+    days = (month_end - month_start).days
+    day_weights = [1.0 + TXN_TREND_STRENGTH * (i / max(1, days - 1)) for i in range(days)]
+    total_w = sum(day_weights)
+    day_probs = [w / total_w for w in day_weights]
+
+    def pick_day_index():
+        r = random.random()
+        s = 0.0
+        for i, p in enumerate(day_probs):
+            s += p
+            if r <= s:
+                return i
+        return days - 1
+
+    def random_dt_in_day(day_idx: int):
+        day_start = month_start + timedelta(days=day_idx)
+        day_end = min(day_start + timedelta(days=1), month_end)
+        return rand_dt(day_start, day_end)
+
+    def pick_sender():
+        # FR generates more txns, CH generates fewer
+        candidates = feature_users
+        w = []
+        for uid in candidates:
+            c = user_meta[uid]["country"]
+            if c == TOP_ADOPTION_COUNTRY:
+                w.append(3.0)
+            elif c == VIP_COUNTRY:
+                w.append(0.4)
+            else:
+                w.append(1.0)
+        return random.choices(candidates, weights=w, k=1)[0]
+
+    def pick_receiver(sender_id: int):
+        sender_country = user_meta[sender_id]["country"]
+
+        if random.random() < SAME_COUNTRY_RECEIVER_PROB:
+            same_country_users = [
+                uid for uid in range(1, n_users + 1)
+                if user_meta[uid]["country"] == sender_country and uid != sender_id
+            ]
+            if same_country_users:
+                return random.choice(same_country_users)
+
+        r = random.randint(1, n_users)
+        while r == sender_id:
+            r = random.randint(1, n_users)
+        return r
+
+    # ----------------------------
+    # Baseline (clean-ish) transaction generation with scenario signals
+    # ----------------------------
     for _ in range(n_txns):
-        sender_id, receiver_id = pick_distinct_users()
+        sender_id = pick_sender()
+        receiver_id = pick_receiver(sender_id)
+
         sender_signup = user_meta[sender_id]["signup_dt"]
         receiver_signup = user_meta[receiver_id]["signup_dt"]
 
-        # Create a "valid" timestamp after both signups when possible
-        # If signup is missing, treat as unknown and just use month_start
+        day_idx = pick_day_index()
+        created_at = random_dt_in_day(day_idx)
+
+        # enforce baseline lifecycle validity; we inject violations later
         start_dt = month_start
         if sender_signup is not None:
             start_dt = max(start_dt, sender_signup)
         if receiver_signup is not None:
             start_dt = max(start_dt, receiver_signup)
+        if created_at < start_dt:
+            created_at = rand_dt(start_dt, month_end)
 
-        # Normally: created_at within [start_dt, month_end)
-        created_at = rand_dt(start_dt, month_end)
+        # base amount
+        base_amount = (10 ** random.uniform(0.3, 2.2))  # ~2..160
 
-        # Amount distribution: lognormal-ish via exponentiation
-        amount = round((10 ** random.uniform(0.3, 2.2)), 2)  # ~2 to ~160
+        # crescendo: amounts increase through the month
+        time_scale = 1.0 + AMOUNT_TREND_STRENGTH * (day_idx / max(1, days - 1))
+
+        # VIP country: low count but huge amounts
+        sender_country = user_meta[sender_id]["country"]
+        country_scale = AMOUNT_MULTIPLIER.get(sender_country, 1.0)
+
+        amount = round(base_amount * time_scale * country_scale, 2)
+
         currency = random.choices(CURRENCIES, weights=[0.85, 0.10, 0.05], k=1)[0]
-        #As Xapo is a leader in crypto banks I assumed BTC is the most used currency
-
         status = random.choices(["completed", "pending", "failed"], weights=[0.90, 0.07, 0.03], k=1)[0]
 
         txns.append({
@@ -210,12 +330,11 @@ def generate_transactions(n_txns: int, n_users: int, month_start: datetime, mont
         })
 
     # ----------------------------
-    # Inject anomalies in transactions, I suspect here is where most of the interest is
+    # Inject anomalies (same as your original intent)
     # ----------------------------
 
-    # 1) Temporal inconsistency: transaction before signup (for sender or receiver)
+    # 1) Temporal inconsistency: created_at before signup
     n_before = max(1, int(n_txns * before_signup_rate))
-    # choose users with later signup so we can create an earlier txn
     eligible_users = [
         uid for uid in range(1, n_users + 1)
         if user_meta[uid]["signup_dt"] is not None and user_meta[uid]["signup_dt"] > (month_start + timedelta(days=3))
@@ -223,30 +342,26 @@ def generate_transactions(n_txns: int, n_users: int, month_start: datetime, mont
     for i in random.sample(range(n_txns), k=min(n_before, n_txns)):
         if eligible_users:
             bad_user = random.choice(eligible_users)
-            # Make this bad_user either sender or receiver
             if random.random() < 0.5:
                 txns[i]["sender_user_id"] = bad_user
             else:
                 txns[i]["receiver_user_id"] = bad_user
 
-            # Force created_at to be before that user's signup
             bad_signup = user_meta[bad_user]["signup_dt"]
             forced_end = max(month_start + timedelta(hours=1), bad_signup - timedelta(minutes=1))
-            forced_start = month_start
-            txns[i]["created_at"] = iso(rand_dt(forced_start, forced_end))
+            txns[i]["created_at"] = iso(rand_dt(month_start, forced_end))
 
-    # 2) NULL in critical field: amount missing
+    # 2) NULL amount
     n_null_amount = max(1, int(n_txns * null_amount_rate))
     for i in random.sample(range(n_txns), k=min(n_null_amount, n_txns)):
-        txns[i]["amount"] = ""  # NULL/blank critical field
+        txns[i]["amount"] = ""
 
-    # 3) Duplicate transaction IDs: simulate retry logic
+    # 3) Duplicate transaction IDs (retry logic)
     n_dupes = max(1, int(n_txns * dup_id_rate))
     if n_txns > 2:
-        # pick some rows to become duplicates of earlier ids
         dup_targets = random.sample(range(1, n_txns), k=min(n_dupes, n_txns - 1))
         for idx in dup_targets:
-            source_idx = random.randrange(0, idx)  # earlier row
+            source_idx = random.randrange(0, idx)
             txns[idx]["transaction_id"] = txns[source_idx]["transaction_id"]
 
     return txns
